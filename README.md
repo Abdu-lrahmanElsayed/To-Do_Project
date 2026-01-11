@@ -11,3 +11,5 @@
 - Permission checks (owners, assigned users, admin)
 - Example serializers and view functions for API operations
 
+# Refactor Details
+In this refactor I will use ViewSets and Routers and Create Custom Permissions
