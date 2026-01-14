@@ -1,76 +1,45 @@
-from django.shortcuts import get_object_or_404
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated, IsAdminUser
-from rest_framework.response import Response
-from rest_framework import status
-from projects.models import Project
-from accounts.models import CustomUser
-from .models import Task
+from rest_framework import viewsets
 from .serializers import TasksListSerializer, TaskCreateSerializer
+from rest_framework.permissions import IsAuthenticated
+from .permissions import IsProjectOwnerOrAdmin, IsAssigned
+from .models import Task
+from django.shortcuts import get_object_or_404
+from projects.models import Project
 
 
-@api_view(['POST'])
-@permission_classes([IsAuthenticated]) 
-def task_create(request, project_id):
-    project = get_object_or_404(Project, id=project_id, owner=request.user)
-    assigned_to = get_object_or_404(CustomUser, id=request.data.get('assigned_to'))
-    serializer = TaskCreateSerializer(data=request.data, context={'request': request})
+class TaskViewSet(viewsets.ModelViewSet):
+    def get_permissions(self):
+        if self.action in ['retrieve', 'update', 'partial_update']:
+            self.permission_classes = [IsAuthenticated, IsAssigned | IsProjectOwnerOrAdmin]
+        elif self.action in ['destroy', 'list', 'create']:
+            self.permission_classes = [IsAuthenticated, IsProjectOwnerOrAdmin]
+        return super().get_permissions()
 
-    if serializer.is_valid():
-        serializer.save(project=project, assigned_to=assigned_to)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
-    
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    def get_queryset(self):
+        """
+        Return tasks visible to the requesting user, optionally filtered by
+        a project id provided either as a URL kwarg `project_pk` (from
+        nested routes) or a query parameter `?project=<id>`.
+        """
+        project_pk = self.kwargs.get('project_pk') or self.request.query_params.get('project')
+        if project_pk:
+            return Task.objects.filter(project__id=project_pk)
+        user = self.request.user
+        if user.is_staff or user.is_superuser:
+            return Task.objects.all()
+        return Task.objects.filter(project__owner=user) | Task.objects.filter(assigned_to=user)
 
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def task_list(request, project_id):
-    project = get_object_or_404(Project, id=project_id)
-    tasks = Task.objects.filter(project=project)
+    def get_serializer_class(self):
+        if self.action in ['create', 'update', 'partial_update']:
+            return TaskCreateSerializer
+        return TasksListSerializer
 
-    if request.user != project.owner:
-        tasks = tasks.filter(assigned_to=request.user)
-
-    serializer = TasksListSerializer(tasks, many=True)
-    return Response(serializer.data, status=status.HTTP_200_OK)
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def task_details(request, project_id, task_id):
-    project = get_object_or_404(Project, id=project_id)
-    task = get_object_or_404(Task, id=task_id, project=project)
-
-    if request.user != project.owner and request.user != task.assigned_to:
-        return Response({'detail': 'Not authorized to view this task.'}, status=status.HTTP_403_FORBIDDEN)
-
-    serializer = TasksListSerializer(task)
-    return Response(serializer.data, status=status.HTTP_200_OK)
-
-@api_view(['PUT', 'PATCH'])
-@permission_classes([IsAuthenticated])
-def task_update(request, project_id, task_id):
-    project = get_object_or_404(Project, id=project_id)
-    task = get_object_or_404(Task, id=task_id, project=project)
-
-    if request.user != project.owner and request.user != task.assigned_to:
-        return Response({'detail': 'Not authorized to update this task.'}, status=status.HTTP_403_FORBIDDEN)
-
-    serializer = TaskCreateSerializer(task, data=request.data, partial=True, context={'request': request})
-
-    if serializer.is_valid():
-        serializer.save(updated_by=request.user)
-        return Response(serializer.data, status=status.HTTP_200_OK)
-    
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-@api_view(['DELETE'])
-@permission_classes([IsAuthenticated])
-def task_delete(request, project_id, task_id):
-    project = get_object_or_404(Project, id=project_id)
-    task = get_object_or_404(Task, id=task_id, project=project)
-
-    if request.user != project.owner:
-        return Response({'detail': 'Not authorized to delete this task.'}, status=status.HTTP_403_FORBIDDEN)
-
-    task.delete()
-    return Response({'detail': 'Task deleted successfully.'}, status=status.HTTP_200_OK)
+    def perform_create(self, serializer):
+        # Prefer project from nested URL (project_pk) or fall back to request data
+        project_pk = self.kwargs.get('project_pk') or self.request.data.get('project')
+        if project_pk:
+            project = get_object_or_404(Project, pk=project_pk)
+            serializer.save(project=project)
+        else:
+            # If no project specified, let serializer attempt to save (may raise IntegrityError)
+            serializer.save()
